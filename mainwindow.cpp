@@ -25,8 +25,8 @@ void MainWindow::initMainWindow()
     QSqlQueryModel *categoryModel = new QSqlQueryModel(this);
     categoryModel->setQuery ("select Name from category");
     QSqlRecord rec = categoryModel->record (0);
-    qDebug() << rec.fieldName (0);
-    qDebug() <<  categoryModel->data(categoryModel->index (1,0)).toString ();
+//    qDebug() << rec.fieldName (0);
+//    qDebug() <<  categoryModel->data(categoryModel->index (1,0)).toString ();
     //商品类别下拉栏中数据加载（新品入库页）
     ui->newCategoryComboBox->setModel (categoryModel);
 
@@ -73,12 +73,15 @@ void MainWindow::onTableSelectChange(int row)
     QSqlQuery query;
 
     //查询当前商品属于哪个类别
-    query.exec (QString("select Name from category where CategoryID=(select"
-                        " CategoryID from commodity where Name='%1'").arg (ui->newNameLineEdit->text ()));
+    bool success = query.exec (QString("select Name from category where CategoryID=(select CategoryID from commodity where Name='%1')").arg (ui->newNameLineEdit->text ()));
     query.next ();
+    //一开始获取的记录是表头！！！，要使用next，才会移到下一行
+//    QSqlRecord rec = query.record ();
+//    qDebug() << rec.isEmpty ();
+//    qDebug() << rec.value (0).toString ();
     //更新类别下拉栏
     ui->newCategoryComboBox->setCurrentText (query.value (0).toString ());
-
+    //qDebug() << query.value (0).toString ();
 
 }
 
@@ -155,25 +158,153 @@ void MainWindow::on_preCountSpinBox_valueChanged(int arg1)
 
 void MainWindow::on_prePlaceOrderPushButton_clicked()
 {
+    QSqlQuery query ;
+    QString otime = QDateTime::currentDateTime ().toString ("yyyy-MM-dd hh:mm:ss");
+    QSqlDatabase::database ().transaction ();
+    bool ordOk = query.exec (QString("update orders set PaySum=%1,OTime='%2' where OrderID=%3").arg (myPaySum).arg (otime).arg (myOrderID));
+    bool uptOk = query.exec (QString("update orderitems set Affirm=1,SendGoods=1 where OrderID=%1").arg (myOrderID));
+    if(ordOk&& uptOk)
+    {
+        QSqlDatabase::database ().commit ();
+        ui->prePlaceOrderPushButton->setEnabled (false);
+        //显示下单记录
+        QString order_record = "日期："+otime +"\r\n订单号："+QString("%1").arg (myOrderID)+"\r\n应付款总额："+QString(" %1¥").arg (myPaySum)+"\r\n下单成功！";
+        QListWidgetItem *split = new QListWidgetItem;
+        split->setText ("***.***.***.***.***.***.***.***.***.***.***.***.");
+        split->setTextAlignment (Qt::AlignCenter);
+        ui->sellListWidget->addItem (split);
+        ui->sellListWidget->addItem (order_record);
+        myPaySum = 0;
+        QMessageBox::information (0,QObject::tr ("提示"),"下单成功！");
+        commodity_model->setTable ("commodity_inf");
+        commodity_model->select ();
+        ui->commodityTableView->setModel (commodity_model);
 
+    }else{
+        QSqlDatabase::database ().rollback ();
+    }
 }
 
+/**
+ * @brief 用户可以选择不同类别的不同商品，指定数量后出售，这里准确地说只是预售，在未下单之前，用户还可以添加新的商品进行订单。
+ */
 void MainWindow::on_preSellPushButton_clicked()
 {
+    QSqlQuery query;
+    //是否处于预售状态
+    if(!myOrdered)
+    {
+        qDebug() << "插入用户名操作："<<query.exec (QString("insert into orders(MemberID,PaySum,PayWay,OTime) values('%1',NULL,NULL,NULL)").arg (myMemberID));
+        myOrdered = true;
+        query.exec (QString("select OrderID from orders where OTime IS NULL"));
+        query.next ();
+        myOrderID = query.value (0).toInt ();
+    }
+    //下面开始预售,由商品的名字查询商品的类别ID
+    qDebug() << "由商品的名字查询商品的类别ID："<<query.exec (QString("select CommodityID from commodity where Name='%1'").arg (ui->preNameComboBox->currentText ()));
+    query.next ();//下移到数据行
+    int commodityid = query.value (0).toInt ();
+    int count = ui->preCountSpinBox->value ();
+    int amount = ui->preCountSpinBox->maximum ()-count;
+
+    //开始下一个事务，事务是不可分割的，具有原子性
+    //-------------------------------------------
+    QSqlDatabase::database ().transaction ();
+    //新增订单项
+    bool insOk = query.exec (QString("insert into orderitems(OrderID,CommodityID,Count) values(%1,%2,%3)").arg (myOrderID).arg (commodityid).arg (count));
+    qDebug() << "插入数据到orderitems："<<insOk;
+    bool uptOk = query.exec (QString("update commodity set Amount=%1 where CommodityID=%2").arg (amount).arg (commodityid));
+    qDebug() << "更新商品数量："<<uptOk;
+    if(insOk && uptOk)
+    {
+        //事务提交
+        //-----------------------------------------
+        QSqlDatabase::database ().commit ();
+        onPreNameComboBoxChange ();
+        //显示预售清单
+        QString curtime = QTime::currentTime ().toString ("hh::mm:ss");
+        QString curname = ui->preNameComboBox->currentText ();
+        QString curcount = QString::number (count,10);
+        QString curoutprice = ui->preOutputPriceLabel->text ();
+        QString curtotal = ui->preTotalLabel->text ();
+        myPaySum += curtotal.toFloat ();
+        QString sell_record = curtime+" "+"售出: "+curname+"\r\n"+
+                "数量："+curcount+"; 单价："+curoutprice+"¥；总价："+
+                curtotal+"¥";
+        QListWidgetItem *split = new QListWidgetItem;
+        split->setText ("—.—.—.—.—.—.—.—.—.—.—.—.—.—.—.—.");
+        split->setTextAlignment (Qt::AlignCenter);
+        ui->sellListWidget->addItem (split);
+        ui->sellListWidget->addItem (sell_record);
+        ui->prePlaceOrderPushButton->setEnabled (true);
+        QMessageBox::information (0,QObject::tr ("提示"),"已加入订单！");
+    }else{
+        //事务回滚：回滚只是针对于还没有commit提交之前，一但进行提交，那就不能进行回滚了
+        //-----------------------------------------
+        QSqlDatabase::database ().rollback ();
+    }
 
 }
 
+/**
+ * @brief 上传图片
+ */
 void MainWindow::on_newUploadPushButton_clicked()
 {
-
+    QString pictureName = QFileDialog::getOpenFileName (this,"选择商品图片",".","Image File(*.png *.jpg)");
+    if(pictureName.isEmpty ()) return;
+    myPicImg.load (pictureName);
+    ui->newPictureLabel->setPixmap (QPixmap::fromImage (myPicImg));
 }
 
 void MainWindow::on_newPutinStorePushButton_clicked()
 {
+    QSqlQuery query;
+    //商品的种类只能选现有的，不能自己添加
+    query.exec (QString("select CategoryID from category where Name='%1'").arg (ui->newCategoryComboBox->currentText ()));
+    query.next ();//移到数据行
+    int categoryid = query.value (0).toInt ();
+    QString name = ui->newNameLineEdit->text ();
+    float inputprice = ui->newInputPriceLineEdit->text ().toFloat ();
+    float outputprice = ui->newOutputPriceLineEdit->text ().toFloat ();
+    int count = ui->newCountSpinBox->value ();
+    query.exec (QString("insert into commodity(CategoryID,Name,Picture,InputPrice,OutputPrice,Amount) values(%1,'%2',NULL,%3,%4,%5)").arg (categoryid).arg (name).arg (inputprice).arg (outputprice).arg (count));
+    //插入图片
+    QByteArray picdata;
+    QBuffer buffer(&picdata);
+    buffer.open (QIODevice::WriteOnly);
+    myPicImg.save (&buffer,"JPG");
+    QVariant var(picdata);
+    QString sqlstr = "update commodity set Picture=? where Name='"+name+"'";
+    query.prepare (sqlstr);
+    query.addBindValue (var);
+    if(!query.exec ())
+    {
+        QMessageBox::information (0,QObject::tr ("提示"),"照片写入失败");
+    }
+    //刷新网格信息
+    commodity_model->setTable ("commodity_inf");
+    commodity_model->select ();
+    ui->commodityTableView->setModel (commodity_model);
 
 }
 
+/**
+ * @brief 清仓操作，当某件商品不再需要时，将其消息记录从数据库删除
+ */
 void MainWindow::on_newClearancePushButton_clicked()
 {
+    QSqlQuery query;
+    //从数据库中删除记录
+    bool success = query.exec (QString("delete from commodity where Name='%1'").arg (ui->newNameLineEdit->text()));
 
+    //刷新界面
+    ui->newNameLineEdit->setText ("");
+    ui->newInputPriceLineEdit->setText ("");
+    ui->newOutputPriceLineEdit->setText ("");
+    ui->newCountSpinBox->setValue (1);
+    ui->newPictureLabel->clear ();
+    commodity_model->setTable ("commodity_inf");
+    commodity_model->select ();
+    ui->commodityTableView->setModel (commodity_model);
 }
